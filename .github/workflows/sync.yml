@@ -1,68 +1,82 @@
 # ==============================================================================
-# Fork仓库自动同步上游 + TG通知（个人极简版）
-# 支持手动触发/定时触发，同步完成后调用TG通知模板
+# 【个人专用】Fork仓库自动同步上游 + 跨仓库调用TG通知
+# 触发方式：1.手动触发 2.定时触发（每天UTC3点=北京时间11点）
+# 核心逻辑：拉取上游仓库最新代码 → 合并到本地Fork → 推送 → 调用TG模板通知结果
 # ==============================================================================
 name: Sync Upstream Repository
 
-# 触发方式：1.手动触发 2.每天凌晨3点定时触发（可选）
+# 触发规则配置
 on:
-  workflow_dispatch:  # 手动触发（核心，推荐）
+  workflow_dispatch:  # 手动触发（核心，推荐：需要同步时手动点运行）
   schedule:
-    - cron: '0 2 * * *'  # 每天UTC时间8点（北京时间10点）自动同步，不需要可删除
+    # 定时触发（可选，每天UTC时间3点执行，注释/删除则关闭自动同步）
+    # cron表达式格式：分 时 日 月 周（UTC时区，北京时间=UTC+8）
+    - cron: '0 3 * * *'
 
-# 最小权限配置
+# 权限配置（最小权限原则）
 permissions:
-  contents: write  # 同步代码需要写入权限
-  pull-requests: read
+  contents: write  # 同步代码需要写入仓库的权限（必须）
+  pull-requests: read  # 可选，仅读取PR信息，无实际作用
 
 jobs:
+  # 核心任务：同步上游仓库代码
   sync-upstream:
-    name: Sync with Upstream
-    runs-on: ubuntu-latest
+    name: Sync with Upstream Repository
+    runs-on: ubuntu-latest  # 运行环境：Ubuntu最新版（GitHub Actions默认）
     steps:
-      # 步骤1：检出当前Fork仓库代码
+      # 步骤1：检出当前Fork仓库的代码到运行环境
       - name: Checkout Fork Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4  # 使用官方检出动作（v4是最新稳定版）
         with:
-          fetch-depth: 0  # 拉取完整提交历史，避免同步冲突
+          fetch-depth: 0  # 拉取完整的提交历史（必须，否则合并时会丢失历史导致冲突）
 
-      # 步骤2：添加上游仓库远程地址 & 拉取最新代码
+      # 步骤2：添加上游仓库地址 → 拉取最新代码 → 合并 → 推送
       - name: Add Upstream & Pull Latest Code
         env:
-          # 【需手动修改】上游仓库地址（替换为你Fork的原仓库）
+          # 【需手动修改1】上游仓库的Git地址（你Fork的原仓库）
+          # 示例：UPSTREAM_REPO: "https://github.com/vuejs/vue.git"
           UPSTREAM_REPO: "https://github.com/ling-drag0n/CloudPaste.git"
-          # 【需手动修改】要同步的分支（一般是main/master）
+          # 【需手动修改2】要同步的分支（大部分仓库是main，部分是master，按需改）
           TARGET_BRANCH: "main"
         run: |
-          # 配置git身份（避免提交时权限报错）
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          # 配置Git身份（Actions机器人需要，否则推送会报错）
+          git config --global user.name "github-actions[bot]"  # 固定值，无需改
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"  # 固定值，无需改
 
-          # 添加上游仓库
+          # 1. 添加上游仓库的远程地址（命名为upstream，方便后续操作）
           git remote add upstream $UPSTREAM_REPO
-          # 拉取上游仓库所有分支最新代码
+          # 2. 拉取上游仓库所有分支的最新代码（确保拿到最新提交）
           git fetch upstream
 
-          # 切换到目标分支并合并上游代码（自动解决简单冲突）
+          # 3. 切换到目标分支（比如main）
           git checkout $TARGET_BRANCH
+          # 4. 合并上游仓库的目标分支代码（--no-edit：自动生成合并提交信息，无需手动确认）
           git merge upstream/$TARGET_BRANCH --no-edit
 
-          # 推送合并后的代码到自己的Fork仓库
+          # 5. 推送合并后的代码到自己的Fork仓库（origin是默认的Fork仓库远程地址）
           git push origin $TARGET_BRANCH
 
-          echo "✅ 同步上游仓库完成"
+          # 输出成功日志
+          echo "✅ 同步上游仓库完成！已将 $UPSTREAM_REPO 的 $TARGET_BRANCH 分支同步到当前Fork仓库"
 
-      # 步骤3：调用TG通知模板（同步成功/失败都推送）
+      # 步骤3：跨仓库调用TG通知模板（无论同步成功/失败都推送）
       - name: Send TG Notification
-        if: always()  # 无论前面步骤成功/失败，都触发通知
-        uses: ./.github/workflows/tg-notify.yml  # 【需确认】TG通知模板的路径（根据实际路径调整）
+        if: always()  # 关键：即使前面的同步步骤失败，也执行通知（避免同步失败收不到提醒）
+        # 【需手动修改3】TG模板仓库的调用路径
+        # 格式：uses: 模板仓库用户名/模板仓库名/.github/workflows/模板文件名.yml@分支名
+        uses: Wliky/pusher/.github/workflows/telegram.yml@main
         with:
+          # 动态生成通知标题：同步成功显示✅，失败显示❌
           notify_title: ${{ job.status == 'success' && '✅ Fork仓库同步成功' || '❌ Fork仓库同步失败' }}
+          # 通知正文（Markdown格式，包含关键信息，方便排查问题）
           notify_content: |
-            **同步信息**：
-            - 上游仓库：${{ env.UPSTREAM_REPO }}
-            - 同步分支：${{ env.TARGET_BRANCH }}
-            - 执行状态：${{ job.status == 'success' ? '成功' : '失败' }}
-            - 运行日志：https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            **📢 Fork仓库同步结果**
+            - 🔗 上游仓库：${{ env.UPSTREAM_REPO }}
+            - 🌿 同步分支：${{ env.TARGET_BRANCH }}
+            - 📊 执行状态：${{ job.status == 'success' ? '成功' : '失败' }}
+            - 📝 运行日志：https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         secrets:
-          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}  # 非必需，留空即可
+          # 从当前同步仓库的Secrets传递TG密钥到模板仓库（模板仓库无需存储密钥）
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}  # 你的TG机器人Token
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}      # 你的TG聊天ID（个人/群组）
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}        # 仅模板仓库是私有時需要，公开则留空
