@@ -1,0 +1,68 @@
+# ==============================================================================
+# Fork仓库自动同步上游 + TG通知（个人极简版）
+# 支持手动触发/定时触发，同步完成后调用TG通知模板
+# ==============================================================================
+name: Sync Upstream Repository
+
+# 触发方式：1.手动触发 2.每天凌晨3点定时触发（可选）
+on:
+  workflow_dispatch:  # 手动触发（核心，推荐）
+  schedule:
+    - cron: '0 2 * * *'  # 每天UTC时间8点（北京时间10点）自动同步，不需要可删除
+
+# 最小权限配置
+permissions:
+  contents: write  # 同步代码需要写入权限
+  pull-requests: read
+
+jobs:
+  sync-upstream:
+    name: Sync with Upstream
+    runs-on: ubuntu-latest
+    steps:
+      # 步骤1：检出当前Fork仓库代码
+      - name: Checkout Fork Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 拉取完整提交历史，避免同步冲突
+
+      # 步骤2：添加上游仓库远程地址 & 拉取最新代码
+      - name: Add Upstream & Pull Latest Code
+        env:
+          # 【需手动修改】上游仓库地址（替换为你Fork的原仓库）
+          UPSTREAM_REPO: "https://github.com/ling-drag0n/CloudPaste.git"
+          # 【需手动修改】要同步的分支（一般是main/master）
+          TARGET_BRANCH: "main"
+        run: |
+          # 配置git身份（避免提交时权限报错）
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 添加上游仓库
+          git remote add upstream $UPSTREAM_REPO
+          # 拉取上游仓库所有分支最新代码
+          git fetch upstream
+
+          # 切换到目标分支并合并上游代码（自动解决简单冲突）
+          git checkout $TARGET_BRANCH
+          git merge upstream/$TARGET_BRANCH --no-edit
+
+          # 推送合并后的代码到自己的Fork仓库
+          git push origin $TARGET_BRANCH
+
+          echo "✅ 同步上游仓库完成"
+
+      # 步骤3：调用TG通知模板（同步成功/失败都推送）
+      - name: Send TG Notification
+        if: always()  # 无论前面步骤成功/失败，都触发通知
+        uses: ./.github/workflows/tg-notify.yml  # 【需确认】TG通知模板的路径（根据实际路径调整）
+        with:
+          notify_title: ${{ job.status == 'success' && '✅ Fork仓库同步成功' || '❌ Fork仓库同步失败' }}
+          notify_content: |
+            **同步信息**：
+            - 上游仓库：${{ env.UPSTREAM_REPO }}
+            - 同步分支：${{ env.TARGET_BRANCH }}
+            - 执行状态：${{ job.status == 'success' ? '成功' : '失败' }}
+            - 运行日志：https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        secrets:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}  # 非必需，留空即可
