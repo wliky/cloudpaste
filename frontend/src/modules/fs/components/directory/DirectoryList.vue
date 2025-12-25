@@ -223,7 +223,7 @@
           <!-- 文件大小与修改时间提示 -->
           <div class="mt-1 text-xs text-center" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
             <span v-if="item.isDirectory && item.isVirtual">-</span>
-            <span v-else>{{ formatFileSize(item.size || 0) }}</span>
+            <span v-else>{{ formatSize(item.size) }}</span>
           </div>
         </div>
       </div>
@@ -252,6 +252,7 @@
       :description="t('mount.rename.enterNewName')"
       :label="t('mount.rename.newName')"
       :initial-value="newName"
+      :validator="validateFsItemNameDialog"
       :confirm-text="t('mount.rename.confirm')"
       :cancel-text="t('mount.rename.cancel')"
       :loading="renameLoading"
@@ -276,8 +277,11 @@ import { IconChevronDown, IconChevronUp, IconDelete, IconDownload, IconFolderOpe
 import { getFileIcon } from "@/utils/fileTypeIcons.js";
 import { useDirectorySort, useFileOperations } from "@/composables/index.js";
 import InputDialog from "@/components/common/dialogs/InputDialog.vue";
+import { createFsItemNameDialogValidator, validateFsItemName } from "@/utils/fsPathUtils.js";
 
 const { t } = useI18n();
+
+const validateFsItemNameDialog = createFsItemNameDialogValidator(t);
 
 // ===== 虚拟滚动配置 =====
 // 虚拟滚动阈值：超过此数量启用虚拟滚动
@@ -437,6 +441,12 @@ const headerGridClass = computed(() => {
 
 // 导入统一的工具函数
 import { formatFileSize } from "@/utils/fileUtils.js";
+
+// 格式化大小：未知则显示 "-"
+const formatSize = (value) => {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return "-";
+  return formatFileSize(value);
+};
 
 // 判断一个项目是否被选中
 const isItemSelected = (item) => {

@@ -1,31 +1,33 @@
 <template>
-  <div class="pdf-preview rounded-lg overflow-hidden mb-2 flex-grow w-full relative">
-    <div class="flex items-center justify-end px-2 py-1 bg-gray-100 dark:bg-gray-700 border-b border-gray-200 dark:border-gray-600">
-      <!-- 多渠道时允许用户选择预览方式（Browser Native / pdfjs 等） -->
-      <select
-        v-if="providerOptions.length > 1"
-        v-model="selectedProviderKey"
-        class="text-xs px-2 py-1 rounded border bg-white dark:bg-gray-800 dark:border-gray-600 dark:text-gray-100"
-      >
-        <option v-for="opt in providerOptions" :key="opt.key" :value="opt.key">
-          {{ opt.label }}
-        </option>
-      </select>
-    </div>
+  <div ref="previewContainerRef" class="pdf-preview rounded-lg overflow-hidden mb-2 flex-grow w-full relative border border-gray-200 dark:border-gray-700">
+    <PreviewProviderHeader
+      :title="filename || 'PDF'"
+      :options="providerOptions"
+      :show-select="providerOptions.length > 1"
+      :show-fullscreen="true"
+      :fullscreen-target="previewContainerRef"
+      v-model="selectedProviderKey"
+      @fullscreen-change="handleFullscreenChange"
+    />
     <iframe
       :src="currentPreviewUrl"
+      allow="fullscreen"
+      allowfullscreen
       frameborder="0"
-      class="w-full h-[calc(100vh-350px)] min-h-[300px]"
+      class="w-full"
+      :class="isFullscreen ? 'h-screen' : 'h-[calc(100vh-350px)] min-h-[300px]'"
       @load="handleLoad"
       @error="handleError"
       v-show="!!currentPreviewUrl && !loading && !error"
     ></iframe>
     <!-- PDF加载状态 -->
     <div v-if="loading" class="absolute inset-0 flex items-center justify-center bg-gray-100 dark:bg-gray-700 rounded-lg">
-      <div class="text-center">
-        <IconRefresh class="animate-spin h-8 w-8 text-blue-500 mx-auto mb-2" />
-        <p class="text-blue-600 dark:text-blue-400">{{ t("fileView.preview.pdf.loading") }}</p>
-      </div>
+      <LoadingIndicator
+        :text="t('fileView.preview.pdf.loading')"
+        size="xl"
+        icon-class="text-blue-500 dark:text-blue-400"
+        text-class="text-blue-600 dark:text-blue-400"
+      />
     </div>
     <!-- PDF错误状态 -->
     <div v-if="error" class="absolute inset-0 flex items-center justify-center bg-gray-100 dark:bg-gray-700 rounded-lg">
@@ -39,9 +41,12 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from "vue";
+import { ref, computed, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { IconExclamation, IconRefresh } from "@/components/icons";
+import { IconExclamation } from "@/components/icons";
+import LoadingIndicator from "@/components/common/LoadingIndicator.vue";
+import { useProviderSelector } from "@/composables/file-preview/useProviderSelector.js";
+import PreviewProviderHeader from "@/components/common/preview/PreviewProviderHeader.vue";
 
 const { t } = useI18n();
 
@@ -61,44 +66,36 @@ const props = defineProps({
     type: String,
     default: "",
   },
+  filename: {
+    type: String,
+    default: "",
+  },
 });
 
 const emit = defineEmits(["load", "error"]);
 
 const loading = ref(true);
 const error = ref(false);
+const previewContainerRef = ref(null);
+const isFullscreen = ref(false);
 
-// 可用预览渠道（包含原生）
-const providerOptions = computed(() => {
-  const options = [];
+const handleFullscreenChange = (val) => {
+  isFullscreen.value = val;
+};
 
-  if (props.nativeUrl || props.previewUrl) {
-    options.push({
-      key: "native",
-      label: t("fileView.preview.pdf.browserNative"),
-      url: props.nativeUrl || props.previewUrl,
-    });
-  }
+const resolvedNativeUrl = computed(() => props.nativeUrl || props.previewUrl || "");
 
-  const providers = props.providers || {};
-  for (const key of Object.keys(providers)) {
-    options.push({
-      key,
-      label: key,
-      url: providers[key],
-    });
-  }
-
-  return options;
-});
-
-const selectedProviderKey = ref("native");
-
-const currentPreviewUrl = computed(() => {
-  const options = providerOptions.value;
-  if (!options.length) return "";
-  const current = options.find((opt) => opt.key === selectedProviderKey.value) || options[0];
-  return current.url || "";
+const {
+  providerOptions,
+  selectedKey: selectedProviderKey,
+  currentUrl: currentPreviewUrl,
+} = useProviderSelector({
+  providers: computed(() => props.providers || {}),
+  nativeUrl: resolvedNativeUrl,
+  nativeLabel: computed(() => t("fileView.preview.pdf.browserNative")),
+  labelMap: computed(() => ({
+    pdfjs: t("fileView.preview.pdf.pdfjsLabel"),
+  })),
 });
 
 const handleLoad = () => {
@@ -113,11 +110,24 @@ const handleError = () => {
   emit("error");
 };
 
-onMounted(() => {
-  const opts = providerOptions.value;
-  if (opts.length) {
-    // 默认优先使用浏览器原生预览
-    selectedProviderKey.value = "native";
-  }
-});
+watch(
+  currentPreviewUrl,
+  (url) => {
+    if (!url) return;
+    loading.value = true;
+    error.value = false;
+  },
+  { immediate: false },
+);
 </script>
+
+<style scoped>
+/* 全屏时预览容器填满屏幕 */
+.pdf-preview :deep(:fullscreen),
+.pdf-preview :deep(:-webkit-full-screen),
+.pdf-preview :deep(:-moz-full-screen) {
+  width: 100vw !important;
+  height: 100vh !important;
+  background: inherit;
+}
+</style>

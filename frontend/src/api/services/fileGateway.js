@@ -25,7 +25,8 @@ function parseFileShareUrl(url) {
   if (!url) return { isFileShare: false };
 
   // Share 文本内容口：/api/share/content/:slug
-  const contentMatch = url.match(/\/api\/share\/content\/([^?]+)/);
+  // 兼容：/api/share/content/:slug 以及 /api/share/content/:slug/:filename
+  const contentMatch = url.match(/\/api\/share\/content\/([^/?#]+)(?:\/[^?]*)?/);
   if (contentMatch) {
     const slug = contentMatch[1];
     const urlObj = new URL(url, window.location.origin);
@@ -40,7 +41,8 @@ function parseFileShareUrl(url) {
   }
 
   // Share 本地代理入口：/api/s/:slug
-  const legacyMatch = url.match(/\/api\/s\/([^?]+)/);
+  // 兼容：/api/s/:slug 以及 /api/s/:slug/:filename
+  const legacyMatch = url.match(/\/api\/s\/([^/?#]+)(?:\/[^?]*)?/);
   if (legacyMatch) {
     const slug = legacyMatch[1];
     const urlObj = new URL(url, window.location.origin);
@@ -154,9 +156,9 @@ export function buildDownloadUrl(file, options = {}) {
 }
 
 export async function getOfficePreviewUrl(file, options = {}) {
-  const preview = file?.documentPreview;
+  const preview = file?.previewSelection;
 
-  // 未提供 documentPreview 或不支持预览时直接返回 null
+  // 未提供 previewSelection 或不支持预览时直接返回 null
   const providers = preview?.providers || {};
   if (!preview || !Object.keys(providers).length) {
     return null;

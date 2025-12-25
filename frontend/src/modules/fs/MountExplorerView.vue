@@ -118,6 +118,7 @@
         :description="t('mount.createFolder.enterName')"
         :label="t('mount.createFolder.folderName')"
         :placeholder="t('mount.createFolder.placeholder')"
+        :validator="validateFsItemNameDialog"
         :confirm-text="t('mount.createFolder.create')"
         :cancel-text="t('mount.createFolder.cancel')"
         :loading="isCreatingFolder"
@@ -135,6 +136,7 @@
         :description="t('mount.rename.enterNewName')"
         :label="t('mount.rename.newName')"
         :initial-value="contextMenuRenameItem?.name || ''"
+        :validator="validateFsItemNameDialog"
         :confirm-text="t('mount.rename.confirm')"
         :cancel-text="t('mount.rename.cancel')"
         :loading="isRenaming"
@@ -284,10 +286,12 @@
         <div v-show="showFilePreview">
           <!-- 预览加载状态 -->
           <div v-if="isPreviewLoading" class="p-8 text-center">
-            <div class="flex flex-col items-center space-y-4">
-              <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"></div>
-              <div class="text-gray-600 dark:text-gray-400">{{ $t("common.loading") }}</div>
-            </div>
+            <LoadingIndicator
+              :text="$t('common.loading')"
+              :dark-mode="darkMode"
+              size="xl"
+              icon-class="text-blue-500"
+            />
           </div>
 
           <!-- 预览错误状态 -->
@@ -399,6 +403,7 @@ import { useI18n } from "vue-i18n";
 import { storeToRefs } from "pinia";
 import { useThemeMode } from "@/composables/core/useThemeMode.js";
 import { IconBack, IconExclamation, IconSearch, IconSettings, IconXCircle } from "@/components/icons";
+import LoadingIndicator from "@/components/common/LoadingIndicator.vue";
 
 // 组合式函数 - 使用统一聚合导出
 import { useSelection, useFileOperations, useUIState, useFileBasket } from "@/composables/index.js";
@@ -429,8 +434,11 @@ import FloatingActionBar from "@/modules/fs/components/shared/FloatingActionBar.
 import FloatingToolbar from "@/modules/fs/components/shared/FloatingToolbar.vue";
 import BackToTop from "@/modules/fs/components/shared/BackToTop.vue";
 import { useExplorerSettings } from "@/composables/useExplorerSettings";
+import { createFsItemNameDialogValidator, isSameOrSubPath, validateFsItemName } from "@/utils/fsPathUtils.js";
 
 const { t } = useI18n();
+
+const validateFsItemNameDialog = createFsItemNameDialogValidator(t);
 
 // 使用组合式函数
 const selection = useSelection();
@@ -719,24 +727,9 @@ const handleSearchItemClick = async (item) => {
  * 处理导航
  */
 const handleNavigate = async (path) => {
-  const normalizeFsPath = (p) => {
-    const raw = typeof p === "string" && p ? p : "/";
-    const withLeading = raw.startsWith("/") ? raw : `/${raw}`;
-    const collapsed = withLeading.replace(/\/{2,}/g, "/");
-    if (collapsed === "/") return "/";
-    return collapsed.replace(/\/+$/, "");
-  };
-
-  const isAncestorOrSame = (maybeAncestor, current) => {
-    const ancestor = normalizeFsPath(maybeAncestor);
-    const cur = normalizeFsPath(current);
-    if (ancestor === "/") return true;
-    return cur === ancestor || cur.startsWith(`${ancestor}/`);
-  };
-
   // 面包屑/返回上级属于“回退导航”：
   // - 优先保留目标目录的 history 快照
-  if (isAncestorOrSame(path, currentViewPath.value)) {
+  if (isSameOrSubPath(path, currentViewPath.value)) {
     await navigateToPreserveHistory(path);
     return;
   }
@@ -809,11 +802,10 @@ const handleCreateFolderCancel = () => {
  * 处理右键菜单重命名确认
  */
 const handleContextMenuRenameConfirm = async (newName) => {
-  if (!contextMenuRenameItem.value || !newName || !newName.trim()) {
-    contextMenuRenameDialogOpen.value = false;
-    contextMenuRenameItem.value = null;
-    return;
-  }
+  if (!contextMenuRenameItem.value || !newName || !newName.trim()) return;
+
+  const nameValidation = validateFsItemName(newName);
+  if (!nameValidation.valid) return;
 
   // 设置 loading 状态
   isRenaming.value = true;
@@ -924,6 +916,9 @@ const handleDelete = (item) => {
  */
 const handleRename = async ({ item, newName }) => {
   if (!item || !newName || !newName.trim()) return;
+
+  const nameValidation = validateFsItemName(newName);
+  if (!nameValidation.valid) return;
 
   // 设置 loading 状态（用于 DirectoryList 内部的重命名对话框）
   isDirectoryListRenaming.value = true;

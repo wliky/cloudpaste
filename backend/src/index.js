@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import adminRoutes from "./routes/adminRoutes.js";
+import adminFsIndexRoutes from "./routes/adminFsIndexRoutes.js";
 import apiKeyRoutes from "./routes/apiKeyRoutes.js";
 import { backupRoutes } from "./routes/backupRoutes.js";
 
@@ -22,7 +23,7 @@ import scheduledRoutes from "./routes/scheduledRoutes.js";
 import { securityContext } from "./security/middleware/securityContext.js";
 import { withRepositories } from "./utils/repositories.js";
 import { errorBoundary } from "./http/middlewares/errorBoundary.js";
-import { normalizeError } from "./http/errors.js";
+import { normalizeError, sanitizeErrorMessageForClient } from "./http/errors.js";
 
 const getTimeSource = () => {
   if (typeof performance !== "undefined" && typeof performance.now === "function") {
@@ -128,8 +129,11 @@ app.use("*", async (c, next) => {
       allowHeaders: [
         "Content-Type",
         "Authorization",
+        "Range",
         "X-API-KEY",
         "X-FS-Path-Token",
+        "X-FS-Path-Tokens",
+        "X-Custom-Auth-Key",
         "Depth",
         "Destination",
         "Overwrite",
@@ -148,7 +152,7 @@ app.use("*", async (c, next) => {
         "X-Share-Options",
       ],
       allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PROPFIND", "PROPPATCH", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK", "HEAD"],
-      exposeHeaders: ["ETag", "Content-Length", "Content-Disposition", "Content-Range", "Accept-Ranges"],
+      exposeHeaders: ["ETag", "Content-Length", "Content-Disposition", "Content-Range", "Accept-Ranges", "X-Request-Id"],
       maxAge: 86400,
       credentials: true,
     });
@@ -179,6 +183,7 @@ app.options("/", (c) => {
 
 // 注册路由
 app.route("/", adminRoutes);
+app.route("/", adminFsIndexRoutes);
 app.route("/", apiKeyRoutes);
 app.route("/", backupRoutes);
 app.route("/", fileViewRoutes);
@@ -210,11 +215,16 @@ app.onError((err, c) => {
   console.error(`[错误] ${normalized.publicMessage}`, err);
   const reqId = c.get("reqId");
   if (reqId) c.header("X-Request-Id", String(reqId));
+  const debugMessage = normalized.expose ? null : sanitizeErrorMessageForClient(normalized.originalError?.message || err);
   return c.json(
     createErrorResponse(
       normalized.status,
       normalized.expose ? normalized.publicMessage : "服务器内部错误",
-      normalized.code
+      normalized.code,
+      {
+        ...(reqId ? { requestId: String(reqId) } : {}),
+        ...(debugMessage ? { debugMessage } : {}),
+      }
     ),
     normalized.status
   );
