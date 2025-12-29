@@ -104,9 +104,6 @@ const app = new Hono();
 
 // 注册中间件
 app.use("*", structuredLogger);
-app.use("*", errorBoundary());
-app.use("*", withRepositories());
-app.use("*", securityContext());
 // 导入WebDAV配置
 import { WEBDAV_BASE_PATH } from "./webdav/auth/config/WebDAVConfig.js";
 
@@ -160,6 +157,10 @@ app.use("*", async (c, next) => {
     return await corsMiddleware(c, next);
   }
 });
+
+app.use("*", errorBoundary());
+app.use("*", withRepositories());
+app.use("*", securityContext());
 
 // 根路径WebDAV OPTIONS兼容性处理器
 // 为1Panel等客户端提供WebDAV能力发现支持

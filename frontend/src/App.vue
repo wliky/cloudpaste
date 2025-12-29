@@ -1,6 +1,7 @@
 <script setup>
-import { ref, onMounted, onBeforeUnmount, computed } from "vue";
+import { ref, onMounted, computed } from "vue";
 import { useRoute } from "vue-router";
+import { useEventListener } from "@vueuse/core";
 import EnvSwitcher from "./components/EnvSwitcher.vue";
 import LanguageSwitcher from "./components/LanguageSwitcher.vue";
 import PWAInstallPrompt from "./components/PWAInstallPrompt.vue";
@@ -53,6 +54,11 @@ const isDev = import.meta.env.DEV;
       return false;
     }
 
+    // 站点配置还没初始化完之前，不要先按默认值显示页脚
+    if (!siteConfigStore.isInitialized) {
+      return false;
+    }
+
     const footerMarkdown = siteConfigStore.siteFooterMarkdown;
     return footerMarkdown && footerMarkdown.trim();
   });
@@ -96,15 +102,11 @@ const isDev = import.meta.env.DEV;
 
     console.log("应用初始化完成");
 
-    window.addEventListener("global-message", handleGlobalMessageEvent);
-    window.addEventListener("global-message-clear", handleGlobalMessageClearEvent);
+    useEventListener(window, "global-message", handleGlobalMessageEvent);
+    useEventListener(window, "global-message-clear", handleGlobalMessageClearEvent);
   });
 
-  // 组件卸载时不再需要额外清理主题监听（由 useThemeMode 管理）
-  onBeforeUnmount(() => {
-    window.removeEventListener("global-message", handleGlobalMessageEvent);
-    window.removeEventListener("global-message-clear", handleGlobalMessageClearEvent);
-  });
+
 </script>
 
 <template>
