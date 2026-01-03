@@ -6,6 +6,9 @@
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
 import { api } from "@/api";
+import { createLogger } from "@/utils/logger.js";
+
+const log = createLogger("StorageConfigsStore");
 
 const CACHE_TTL = 5 * 60 * 1000; // 5 分钟缓存
 const FETCH_LIMIT = 200; // 通常足够覆盖所有配置
@@ -28,7 +31,7 @@ const STORAGE_TYPE_SCHEMA = {
     label: "OneDrive 存储",
     description: "基于 Microsoft OneDrive / Graph API 的云存储，支持预签名直传",
     capabilities: {
-      multipart: false,
+      multipart: true,
       presigned: true,
       requiresProxy: false,
       preview: "signed-url",
@@ -96,6 +99,17 @@ const STORAGE_TYPE_SCHEMA = {
     capabilities: {
       multipart: false,
       presigned: false,
+      requiresProxy: true,
+      preview: "proxy",
+    },
+  },
+  HUGGINGFACE_DATASETS: {
+    type: "HUGGINGFACE_DATASETS",
+    label: "HuggingFace Datasets",
+    description: "将 HuggingFace Datasets 映射为文件系统，支持预签名直传与分片上传",
+    capabilities: {
+      multipart: true,
+      presigned: true,
       requiresProxy: true,
       preview: "proxy",
     },
@@ -214,7 +228,7 @@ export const useStorageConfigsStore = defineStore("storageConfigs", () => {
         return configs.value;
       })
       .catch((err) => {
-        console.error("加载存储配置失败", err);
+        log.error("加载存储配置失败", err);
         error.value = err;
         throw err;
       })

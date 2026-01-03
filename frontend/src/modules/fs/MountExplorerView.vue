@@ -265,6 +265,8 @@
                   :current-path="currentPath"
                   :items="visibleItems"
                   :loading="loading"
+                  :has-more="directoryHasMore"
+                  :loading-more="directoryLoadingMore"
                   :is-virtual="isVirtualDirectory"
                   :dark-mode="darkMode"
                   :view-mode="viewMode"
@@ -281,6 +283,7 @@
                   @rename="handleRename"
                   @delete="handleDelete"
                   @preview="handlePreview"
+                  @load-more="handleLoadMore"
                   @item-select="handleItemSelect"
                   @toggle-select-all="toggleSelectAll"
                   @show-message="handleShowMessage"
@@ -452,8 +455,10 @@ import BackToTop from "@/modules/fs/components/shared/BackToTop.vue";
 import { useExplorerSettings } from "@/composables/useExplorerSettings";
 import { createFsItemNameDialogValidator, isSameOrSubPath, validateFsItemName } from "@/utils/fsPathUtils.js";
 import { useFsMediaLightbox } from "@/modules/fs/composables/useFsMediaLightbox";
+import { createLogger } from "@/utils/logger.js";
 
 const { t } = useI18n();
+const log = createLogger("MountExplorerView");
 
 const validateFsItemNameDialog = createFsItemNameDialogValidator(t);
 
@@ -483,6 +488,8 @@ const {
   directoryItems,
   isVirtualDirectory,
   directoryMeta,
+  directoryHasMore,
+  directoryLoadingMore,
   isAdmin,
   hasApiKey,
   hasFilePermission,
@@ -506,6 +513,7 @@ const {
   consumePendingScrollRestore,
   invalidateCaches,
   removeItemsFromCurrentDirectory,
+  loadMoreCurrentDirectory,
 } = useMountExplorerController();
 
 const { y: windowScrollY } = useWindowScroll();
@@ -738,7 +746,6 @@ const { isDarkMode: darkMode } = useThemeMode();
 
 // 权限变化处理
 const handlePermissionChange = (hasPermission) => {
-  console.log("MountExplorer: 权限状态变化", hasPermission);
   // 权限状态会自动更新，这里只需要记录日志
 };
 
@@ -806,8 +813,6 @@ const handleCloseSearchModal = () => {
 // 处理搜索结果项点击
 const handleSearchItemClick = async (item) => {
   try {
-    console.log("搜索结果项点击:", item);
-
     if (!item.isDirectory) {
       await navigateToFile(item.path);
     } else {
@@ -817,7 +822,7 @@ const handleSearchItemClick = async (item) => {
     // 关闭搜索模态框
     closeSearchModal();
   } catch (error) {
-    console.error("搜索结果导航失败:", error);
+    log.error("搜索结果导航失败:", error);
     showMessage("error", "导航失败: " + error.message);
   }
 };
@@ -847,6 +852,13 @@ const handlePrefetch = (path) => {
  */
 const handleRefresh = async () => {
   await refreshDirectory();
+};
+
+/**
+ * 处理“加载更多”（用于上游分页的目录）
+ */
+const handleLoadMore = async () => {
+  await loadMoreCurrentDirectory();
 };
 
 /**
@@ -885,7 +897,7 @@ const handleCreateFolderConfirm = async (folderName) => {
       showMessage("error", result.message);
     }
   } catch (error) {
-    console.error("创建文件夹失败:", error);
+    log.error("创建文件夹失败:", error);
     showMessage("error", "创建文件夹失败，请重试");
   } finally {
     isCreatingFolder.value = false;
@@ -939,7 +951,7 @@ const handleContextMenuRenameConfirm = async (newName) => {
       showMessage("error", result.message);
     }
   } catch (error) {
-    console.error("重命名失败:", error);
+    log.error("重命名失败:", error);
     showMessage("error", error.message || t("mount.rename.failed"));
   } finally {
     isRenaming.value = false;
@@ -961,7 +973,7 @@ const closeBasket = () => {
   try {
     fileBasket.closeBasket();
   } catch (error) {
-    console.error("关闭文件篮面板失败:", error);
+    log.error("关闭文件篮面板失败:", error);
   }
 };
 
@@ -1124,7 +1136,7 @@ const confirmDelete = async () => {
       showMessage("error", result.message);
     }
   } catch (error) {
-    console.error("删除操作失败:", error);
+    log.error("删除操作失败:", error);
     showMessage("error", error.message || t("mount.messages.deleteFailed", { message: t("common.unknown") }));
   } finally {
     isDeleting.value = false;
@@ -1146,7 +1158,7 @@ const handleBatchAddToBasket = () => {
       showMessage("error", result.message);
     }
   } catch (error) {
-    console.error("批量添加到文件篮失败:", error);
+    log.error("批量添加到文件篮失败:", error);
     showMessage("error", t("fileBasket.messages.batchAddFailed"));
   }
 };
@@ -1160,14 +1172,24 @@ const handleCloseUploadModal = () => {
   closeUploadModal();
 };
 
-const handleUploadSuccess = async () => {
-  showMessage("success", t("mount.messages.uploadSuccess"));
+const handleUploadSuccess = async (payload) => {
+  const count = Number(payload?.count || 0);
+  const skippedUploadCount = Number(payload?.skippedUploadCount || 0);
+
+  if (skippedUploadCount > 0) {
+    showMessage("success", t("mount.messages.uploadSuccessWithSkipped", { count, skipped: skippedUploadCount }));
+  } else if (count > 1) {
+    // 兼容：多文件时给更明确的提示
+    showMessage("success", t("mount.messages.uploadSuccessWithCount", { count }));
+  } else {
+    showMessage("success", t("mount.messages.uploadSuccess"));
+  }
   invalidateCaches();
   await refreshDirectory();
 };
 
 const handleUploadError = (error) => {
-  console.error("上传失败:", error);
+  log.error("上传失败:", error);
   showMessage("error", error.message || t("mount.messages.uploadFailed"));
 };
 
@@ -1209,7 +1231,6 @@ const handleCloseTasksModal = () => {
  * 处理任务完成事件 - 自动刷新当前目录
  */
 const handleTaskCompleted = async (event) => {
-  console.log('[MountExplorer] 任务完成，自动刷新目录:', event?.tasks?.length || 0, '个任务');
   // 延迟一小段时间再刷新，确保后端数据已同步
   setTimeout(async () => {
     try {
@@ -1217,7 +1238,7 @@ const handleTaskCompleted = async (event) => {
       await refreshDirectory();
       showMessage('success', t('mount.taskManager.taskCompletedRefresh'));
     } catch (error) {
-      console.error('[MountExplorer] 刷新目录失败:', error);
+      log.error('[MountExplorer] 刷新目录失败:', error);
     }
   }, 500);
 };
@@ -1226,7 +1247,6 @@ const handleTaskCompleted = async (event) => {
  * 处理任务创建事件
  */
 const handleTaskCreated = (taskInfo) => {
-  console.log("文件篮任务已创建:", taskInfo);
   // 可以在这里添加额外的任务跟踪逻辑
   // 例如：打开任务管理器面板
   // openTasksModal();
@@ -1337,8 +1357,6 @@ const handleFileContextMenu = (payload) => {
 
 // 密码验证事件处理
 const handlePasswordVerified = ({ path, token, message }) => {
-  console.log("密码验证成功:", { path, token });
-
   // 保存验证 token
   pathPassword.savePathToken(path, token);
 
@@ -1354,8 +1372,6 @@ const handlePasswordVerified = ({ path, token, message }) => {
 };
 
 const handlePasswordCancel = async () => {
-  console.log("密码验证取消/返回");
-
   // 关闭密码弹窗
   pathPassword.closePasswordDialog();
   pathPassword.clearPendingPath();
@@ -1374,29 +1390,31 @@ const handlePasswordCancel = async () => {
     }
   }
 
-  console.log("导航到父目录:", { from: currentPathValue, to: parentPath });
-
   // 导航到父目录
   await navigateTo(parentPath);
 };
 
 const handlePasswordClose = () => {
-  console.log("密码弹窗关闭");
   pathPassword.closePasswordDialog();
 };
 
 const handlePasswordError = ({ message }) => {
-  console.error("密码验证错误:", message);
+  log.error("密码验证错误:", message);
   showMessage("error", message);
 };
 
 // 预览相关方法
+let lastPreviewLoadedKey = "";
 const handlePreviewLoaded = () => {
-  console.log("预览加载完成");
+  // 避免同一个文件在媒体事件重复触发时刷屏
+  const f = previewInfo.value || previewFile.value;
+  const key = f?.path || f?.name || "";
+  if (key && key === lastPreviewLoadedKey) return;
+  lastPreviewLoadedKey = key;
 };
 
 const handlePreviewError = (error) => {
-  console.error("预览加载失败:", error);
+  log.error("预览加载失败:", error);
   showMessage("error", t("mount.messages.previewError"));
 };
 
@@ -1425,7 +1443,6 @@ provide("navigateToFile", navigateToFile);
 
 // 处理认证状态变化
 const handleAuthStateChange = (event) => {
-  console.log("MountExplorer: 认证状态变化", event.detail);
   // 权限状态会自动更新，这里只需要记录日志
 };
 
@@ -1463,29 +1480,14 @@ watch(
   () => currentPath.value,
   (newPath, oldPath) => {
     if (newPath !== oldPath && pathPassword.showPasswordDialog.value) {
-      console.log("路径变化，关闭密码弹窗:", { from: oldPath, to: newPath });
       pathPassword.closePasswordDialog();
       pathPassword.clearPendingPath();
     }
   }
 );
 
-// 组件挂载时执行
-onMounted(async () => {
-  console.log("MountExplorer权限状态:", {
-    isAdmin: isAdmin.value,
-    hasApiKey: hasApiKey.value,
-    hasFilePermission: hasFilePermission.value,
-    hasMountPermission: hasMountPermission.value,
-    hasPermission: hasPermission.value,
-    apiKeyInfo: apiKeyInfo.value,
-  });
-});
-
 // 组件卸载时清理资源
 onBeforeUnmount(() => {
-  console.log("MountExplorerView组件卸载，清理资源");
-
   // 清理 clearHighlightHandler 事件监听器
   if (typeof stopClearHighlightListener === "function") {
     stopClearHighlightListener();

@@ -6,6 +6,7 @@ import { useFsService } from "@/modules/fs";
 import { useViewStateMachine } from "./composables/useViewStateMachine";
 import { ViewState } from "./constants/ViewState";
 import { normalizeFsPath, toDirApiPath } from "@/utils/fsPathUtils.js";
+import { createLogger } from "@/utils/logger.js";
 
 const HISTORY_LIMIT = 20;
 /** @type {Map<string, any>} */
@@ -148,6 +149,7 @@ export function useMountExplorerController() {
 
   const authStore = useAuthStore();
   const fsService = useFsService();
+  const log = createLogger("MountExplorerController");
 
   const stateMachine = useViewStateMachine();
 
@@ -166,6 +168,9 @@ export function useMountExplorerController() {
   const directoryItems = computed(() => directoryData.value?.items || []);
   const isVirtualDirectory = computed(() => !!directoryData.value?.isVirtual);
   const directoryMeta = computed(() => directoryData.value?.meta || null);
+  const directoryNextCursor = computed(() => (directoryData.value && typeof directoryData.value.nextCursor === "string" ? directoryData.value.nextCursor : null));
+  const directoryHasMore = computed(() => !!directoryNextCursor.value);
+  const directoryLoadingMore = ref(false);
 
   // “待恢复滚动值”：只在“预览 → 列表”这类场景使用
   const pendingScrollRestore = ref(null);
@@ -582,6 +587,49 @@ export function useMountExplorerController() {
     isDirRecord.clear();
   };
 
+  const loadMoreCurrentDirectory = async () => {
+    const data = directoryData.value;
+    if (!data || !Array.isArray(data.items)) return false;
+    const cursor = directoryNextCursor.value;
+    if (!cursor) return false;
+    if (directoryLoadingMore.value) return false;
+    if (loading.value) return false;
+
+    directoryLoadingMore.value = true;
+    try {
+      const more = await fsService.getDirectoryList(currentPath.value, { cursor });
+      if (!more || !Array.isArray(more.items)) {
+        return false;
+      }
+
+      // 防御：只允许 append 同一路径的分页结果
+      if (String(more.path || "") !== String(data.path || "")) {
+        log.warn("分页目录结果路径不一致，已跳过 append:", { current: data.path, next: more.path });
+        return false;
+      }
+
+      const existed = new Set(data.items.map((it) => it?.path).filter(Boolean));
+      const appended = more.items.filter((it) => it && it.path && !existed.has(it.path));
+
+      directoryData.value = {
+        ...data,
+        items: [...data.items, ...appended],
+        // 后端会对 HF 分页返回 nextCursor
+        nextCursor: typeof more.nextCursor === "string" && more.nextCursor ? more.nextCursor : null,
+        hasMore: !!more.nextCursor,
+      };
+
+      return true;
+    } catch (e) {
+      const msg = e?.message || "加载更多失败";
+      log.warn("loadMoreCurrentDirectory failed:", e);
+      error.value = msg;
+      return false;
+    } finally {
+      directoryLoadingMore.value = false;
+    }
+  };
+
   // 认证域变更时清理缓存：避免跨账号/跨 basicPath 的“幽灵恢复”
   watch(
     () =>
@@ -630,6 +678,8 @@ export function useMountExplorerController() {
     directoryItems,
     isVirtualDirectory,
     directoryMeta,
+    directoryHasMore,
+    directoryLoadingMore,
     isAdmin,
     hasApiKey,
     hasFilePermission,
@@ -665,5 +715,6 @@ export function useMountExplorerController() {
     refreshCurrentRoute,
     prefetchDirectory,
     consumePendingScrollRestore,
+    loadMoreCurrentDirectory,
   };
 }

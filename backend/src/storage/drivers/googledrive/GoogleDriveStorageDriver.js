@@ -35,6 +35,7 @@ import {
   listSharedWithMeDirectory,
   injectSharedWithMeEntry,
 } from "./GoogleDriveSharedView.js";
+import { decryptIfNeeded } from "../../../utils/crypto.js";
 
 
 export class GoogleDriveStorageDriver extends BaseDriver {
@@ -47,14 +48,14 @@ export class GoogleDriveStorageDriver extends BaseDriver {
     this.type = "GOOGLE_DRIVE";
     this.encryptionSecret = encryptionSecret;
 
-    // 能力：READER/WRITER/ATOMIC/PROXY/SEARCH/MULTIPART
+    // 能力：READER/WRITER/ATOMIC/PROXY/MULTIPART
     this.capabilities = [
       CAPABILITIES.READER,
       CAPABILITIES.WRITER,
       CAPABILITIES.ATOMIC,
       CAPABILITIES.PROXY,
-      CAPABILITIES.SEARCH,
       CAPABILITIES.MULTIPART,
+      CAPABILITIES.PAGED_LIST,
     ];
 
     // 配置字段
@@ -79,6 +80,13 @@ export class GoogleDriveStorageDriver extends BaseDriver {
    * - 验证 token 可用性
    */
   async initialize() {
+    // secret 字段可能以 encrypted:* 存在（由存储配置 CRUD 统一加密写入）
+    const decryptedClientSecret = await decryptIfNeeded(this.clientSecret, this.encryptionSecret);
+    this.clientSecret = typeof decryptedClientSecret === "string" ? decryptedClientSecret : this.clientSecret;
+
+    const decryptedRefreshToken = await decryptIfNeeded(this.refreshToken, this.encryptionSecret);
+    this.refreshToken = typeof decryptedRefreshToken === "string" ? decryptedRefreshToken : this.refreshToken;
+
     this.authManager = new GoogleDriveAuthManager({
       useOnlineApi: this.useOnlineApi,
       apiAddress: this.apiAddress,
@@ -163,7 +171,8 @@ export class GoogleDriveStorageDriver extends BaseDriver {
       };
     }
 
-    for (const segment of segmentsForNormal) {
+    for (let i = 0; i < segmentsForNormal.length; i++) {
+      const segment = segmentsForNormal[i];
       const q = `'${currentId}' in parents and name = '${segment.replace(/'/g, "\\'")}' and trashed = false`;
       const res = await this.apiClient.listFiles(currentId, { q, pageSize: 2 });
       const files = Array.isArray(res.files) ? res.files : [];
@@ -175,6 +184,16 @@ export class GoogleDriveStorageDriver extends BaseDriver {
       }
       lastItem = files[0];
       currentId = lastItem.id;
+
+      const isDirectory = lastItem.mimeType === "application/vnd.google-apps.folder";
+      const hasMoreSegments = i < segmentsForNormal.length - 1;
+
+      if (!isDirectory && hasMoreSegments) {
+        throw new DriverError(`目标父路径不是目录: ${effectivePath}`, {
+          status: 400,
+          code: "DRIVER_ERROR.GDRIVE.NOT_DIRECTORY",
+        });
+      }
     }
 
     const isDirectory = lastItem.mimeType === "application/vnd.google-apps.folder";
@@ -235,6 +254,15 @@ export class GoogleDriveStorageDriver extends BaseDriver {
     const { mount, subPath, db } = options;
     const effectivePath = typeof subPath === "string" ? subPath : path;
 
+    // 目录分页（可选）
+    // - cursor：Google Drive 的 nextPageToken（不透明字符串）
+    // - limit：单页数量（Drive API 支持 pageSize + nextPageToken）
+    const cursorRaw = options?.cursor != null && String(options.cursor).trim() ? String(options.cursor).trim() : null;
+    const limitRaw = options?.limit != null && options.limit !== "" ? Number(options.limit) : null;
+    const limit =
+      limitRaw != null && Number.isFinite(limitRaw) && limitRaw > 0 ? Math.max(1, Math.min(1000, Math.floor(limitRaw))) : null;
+    const paged = options?.paged === true || !!cursorRaw || limit != null;
+
     const segments = this._splitPath(effectivePath || "");
 
     // sharedWithMe 虚拟目录：路径以 __shared_with_me__ 开头时走专用分支
@@ -245,6 +273,7 @@ export class GoogleDriveStorageDriver extends BaseDriver {
         apiClient: this.apiClient,
         mount,
         db,
+        options: { cursor: cursorRaw, limit, paged, refresh: options?.refresh === true },
       });
     }
 
@@ -253,8 +282,23 @@ export class GoogleDriveStorageDriver extends BaseDriver {
       throw new DriverError("目标路径不是目录", { status: 400 });
     }
 
-    const res = await this.apiClient.listFiles(fileId, { pageSize: 1000 });
-    const files = Array.isArray(res.files) ? res.files : [];
+    /** @type {any[]} */
+    let files = [];
+    let nextCursor = null;
+    if (paged) {
+      const res = await this.apiClient.listFiles(fileId, { pageSize: limit ?? 1000, pageToken: cursorRaw || undefined });
+      files = Array.isArray(res?.files) ? res.files : [];
+      nextCursor = res?.nextPageToken ? String(res.nextPageToken) : null;
+    } else {
+      let pageToken = undefined;
+      while (true) {
+        const res = await this.apiClient.listFiles(fileId, { pageSize: limit ?? 1000, pageToken });
+        const pageFiles = Array.isArray(res?.files) ? res.files : [];
+        files.push(...pageFiles);
+        pageToken = res?.nextPageToken ? String(res.nextPageToken) : undefined;
+        if (!pageToken) break;
+      }
+    }
 
     const formattedItems = await Promise.all(
       files.map(async (item) => {
@@ -304,7 +348,14 @@ export class GoogleDriveStorageDriver extends BaseDriver {
       mount_id: mount?.id,
       storage_type: this.type,
       items: formattedItems,
+      ...(paged ? { hasMore: !!nextCursor, nextCursor } : {}),
     };
+  }
+
+  // ===== 可选能力：目录分页 =====
+  // Google Drive 的 files.list 天然分页（nextPageToken）。
+  supportsDirectoryPagination() {
+    return true;
   }
 
   /**
@@ -440,11 +491,24 @@ export class GoogleDriveStorageDriver extends BaseDriver {
       mimeType: contentType || "application/octet-stream",
     };
 
-    // 存储路径使用挂载视图路径 + 文件名，便于前端后续刷新
-    const storagePath =
-      typeof path === "string" && path.length > 0
-        ? (isDirectoryPath(path) ? `${path}${fileName}` : `${path}/${fileName}`)
-        : `/${fileName}`;
+    // storagePath 语义对齐：
+    // - FS（mount 视图）：返回挂载视图的最终路径（path + fileName）
+    // - storage-first（ObjectStore/分享上传/直传）：返回 subPath/key（已包含文件名）
+    const basePathRaw = mount
+      ? path
+      : typeof subPath === "string" && subPath.length > 0
+        ? subPath
+        : path;
+    const basePath = String(basePathRaw || "").replace(/[\\]+/g, "/").replace(/\/+/g, "/");
+    const safeFileName = String(fileName || "").trim() || "unnamed";
+
+    let storagePath = basePath;
+    if (!storagePath) {
+      storagePath = safeFileName;
+    } else if (isDirectoryPath(storagePath)) {
+      storagePath = `${storagePath}${safeFileName}`;
+    }
+    storagePath = storagePath.replace(/[\\]+/g, "/").replace(/\/+/g, "/");
 
     // 特殊处理：空文件（contentLength === 0）直接通过 metadata 创建
     if (typeof contentLength === "number" && Number.isFinite(contentLength) && contentLength === 0) {
@@ -1058,79 +1122,6 @@ export class GoogleDriveStorageDriver extends BaseDriver {
     return full;
   }
 
-  /**
-   * 搜索文件/目录
-   * @param {string} query
-   * @param {Object} options
-   */
-  async search(query, options = {}) {
-    this._ensureInitialized();
-    const { mount, searchPath = null, maxResults = 1000, db } = options;
-
-    if (!mount) {
-      throw new ValidationError("Google Drive 搜索需要提供挂载点信息");
-    }
-
-    const trimmedQuery = String(query || "").trim();
-    if (!trimmedQuery) {
-      throw new ValidationError("搜索关键字不能为空");
-    }
-
-    const q = `name contains '${trimmedQuery.replace(/'/g, "\\'")}' and trashed = false`;
-    const res = await this.apiClient.listFiles(this.rootId, { q, pageSize: maxResults });
-    const files = Array.isArray(res.files) ? res.files : [];
-
-    const folderPathCache = new Map();
-    const normalizedSearchPath = searchPath
-      ? (searchPath.replace(/\/+$/g, "") || "/")
-      : null;
-
-    const results = [];
-
-    for (const item of files) {
-      const isDirectory = item.mimeType === "application/vnd.google-apps.folder";
-      const name = item.name;
-      const size = isDirectory ? null : Number(item.size || 0);
-      const modified = item.modifiedTime ? new Date(item.modifiedTime) : null;
-      const mimetype = isDirectory ? "application/x-directory" : item.mimeType || null;
-
-      const rawFsPath = await this._buildFsPathFromDriveItem(
-        item,
-        mount,
-        folderPathCache,
-      );
-      let finalPath = rawFsPath;
-      if (isDirectory && !finalPath.endsWith("/")) {
-        finalPath = `${finalPath}/`;
-      }
-
-      if (
-        normalizedSearchPath &&
-        !finalPath.startsWith(
-          normalizedSearchPath === "/" ? normalizedSearchPath : `${normalizedSearchPath}/`,
-        )
-      ) {
-        continue;
-      }
-
-      const info = await buildFileInfo({
-        fsPath: finalPath,
-        name,
-        isDirectory,
-        size,
-        modified,
-        mimetype,
-        mount,
-        storageType: this.type,
-        db,
-      });
-
-      results.push(info);
-    }
-
-    return results;
-  }
-
   // ========== MULTIPART 能力委托（thin wrapper，委托给 GoogleDriveUploadOperations） ==========
 
   async initializeFrontendMultipartUpload(subPath, options = {}) {
@@ -1158,9 +1149,9 @@ export class GoogleDriveStorageDriver extends BaseDriver {
     return this.uploadOps.listMultipartParts(subPath, uploadId, options);
   }
 
-  async refreshMultipartUrls(subPath, uploadId, partNumbers, options = {}) {
+  async signMultipartParts(subPath, uploadId, partNumbers, options = {}) {
     this._ensureInitialized();
-    return this.uploadOps.refreshMultipartUrls(subPath, uploadId, partNumbers, options);
+    return this.uploadOps.signMultipartParts(subPath, uploadId, partNumbers, options);
   }
 
   async proxyFrontendMultipartChunk(sessionRow, body, options = {}) {

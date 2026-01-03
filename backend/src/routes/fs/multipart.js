@@ -5,8 +5,21 @@ import { MountManager } from "../../storage/managers/MountManager.js";
 import { FileSystem } from "../../storage/fs/FileSystem.js";
 import { getEncryptionSecret } from "../../utils/environmentUtils.js";
 import { usePolicy } from "../../security/policies/policies.js";
-import { findUploadSessionById } from "../../utils/uploadSessions.js";
+import { findUploadSessionById, normalizeUploadSessionUserId, updateUploadSessionById } from "../../utils/uploadSessions.js";
 import { validateFsItemName } from "../../storage/fs/utils/FsInputValidator.js";
+
+/**
+ * 分片上传（multipart）
+ *
+ * 1) per_part_url：后端返回每一片的预签名 URL，浏览器直传到上游（S3/HuggingFace 等）
+ * 2) single_session：后端返回一个会话 uploadUrl，浏览器把每片 PUT 给 CloudPaste，再由后端转发（GoogleDrive/OneDrive/Telegram 等）
+ *
+ * - per_part_url：后端看不到每片 PUT 的响应（拿不到 ETag），因此“已上传分片”必须由策略（policy）定义：
+ *   - server_can_list：服务端可向上游 ListParts（S3/R2）
+ *   - client_keeps：客户端本地保存 parts（HuggingFace）
+ * - single_session：每片都经过后端，后端可记录进度（server_records）
+ *
+ */
 
 const toAbsoluteUrlIfRelative = (requestUrl, maybeUrl) => {
   if (typeof maybeUrl !== "string" || maybeUrl.length === 0) {
@@ -80,16 +93,40 @@ export const registerMultipartRoutes = (router, helpers) => {
     return { db: c.env.DB, encryptionSecret: getEncryptionSecret(c), repositoryFactory: c.get("repos"), userInfo, userIdOrInfo, userType };
   };
 
+  const assertUploadSessionOwnedByUser = (sessionRow, userIdOrInfo, userType) => {
+    if (!sessionRow) {
+      throw new ValidationError("未找到对应的上传会话");
+    }
+
+    const expectedUserId = normalizeUploadSessionUserId(userIdOrInfo, userType);
+    const rowUserId = String(sessionRow.user_id || "");
+    const rowUserType = String(sessionRow.user_type || "");
+
+    // 必须至少匹配 user_id；user_type 为空时视为兼容旧数据（不做强校验）
+    const idMatches = rowUserId === String(expectedUserId || "");
+    const typeMatches = !rowUserType || rowUserType === String(userType || "");
+
+    if (!idMatches || !typeMatches) {
+      throw new AuthenticationError("上传会话不属于当前用户，拒绝访问");
+    }
+  };
+
   const assertValidFileName = (fileName) => {
     const result = validateFsItemName(fileName);
     if (result.valid) return;
     throw new ValidationError(result.message);
   };
 
+  // =====================================================================
+  // == FS 分片上传（multipart）：初始化 / 完成 / 中止（通用生命周期接口） ==
+  // =====================================================================
+
   router.post("/api/fs/multipart/init", parseJsonBody, usePolicy("fs.upload", { pathResolver: jsonPathResolver() }), async (c) => {
     const { db, encryptionSecret, repositoryFactory, userIdOrInfo, userType } = requireUserContext(c);
     const body = c.get("jsonBody");
     const { path, fileName, fileSize, partSize = 5 * 1024 * 1024, partCount } = body;
+    const sha256 = body?.sha256 || body?.oid || null;
+    const contentType = body?.contentType || body?.mimetype || null;
 
     if (!path || !fileName) {
       throw new ValidationError("缺少必要参数");
@@ -107,6 +144,7 @@ export const registerMultipartRoutes = (router, helpers) => {
       userType,
       partSize,
       partCount,
+      { sha256, contentType },
     );
 
     return jsonOk(c, ensureAbsoluteSessionUploadUrl(c, result), "前端分片上传初始化成功");
@@ -117,17 +155,24 @@ export const registerMultipartRoutes = (router, helpers) => {
     const body = c.get("jsonBody");
     const { path, uploadId, parts, fileName, fileSize } = body;
 
-    if (!path || !uploadId || !Array.isArray(parts) || parts.length === 0) {
+    if (!path || !uploadId) {
       throw new ValidationError("缺少必要参数");
+    }
+    if (parts != null && !Array.isArray(parts)) {
+      throw new ValidationError("parts 参数无效");
     }
 
     if (fileName) {
       assertValidFileName(fileName);
     }
 
+    const sessionRow = await findUploadSessionById(db, { id: uploadId });
+    assertUploadSessionOwnedByUser(sessionRow, userIdOrInfo, userType);
+
     const mountManager = new MountManager(db, encryptionSecret, repositoryFactory, { env: c.env });
     const fileSystem = new FileSystem(mountManager);
-  const result = await fileSystem.completeFrontendMultipartUpload(path, uploadId, parts, fileName, fileSize, userIdOrInfo, userType);
+    const safeParts = Array.isArray(parts) ? parts : [];
+    const result = await fileSystem.completeFrontendMultipartUpload(path, uploadId, safeParts, fileName, fileSize, userIdOrInfo, userType);
 
     return jsonOk(c, { ...result, publicUrl: result.publicUrl || null }, "前端分片上传完成");
   });
@@ -143,12 +188,19 @@ export const registerMultipartRoutes = (router, helpers) => {
 
     assertValidFileName(fileName);
 
+    const sessionRow = await findUploadSessionById(db, { id: uploadId });
+    assertUploadSessionOwnedByUser(sessionRow, userIdOrInfo, userType);
+
     const mountManager = new MountManager(db, encryptionSecret, repositoryFactory, { env: c.env });
     const fileSystem = new FileSystem(mountManager);
     await fileSystem.abortFrontendMultipartUpload(path, uploadId, fileName, userIdOrInfo, userType);
 
     return jsonOk(c, undefined, "已中止分片上传");
   });
+
+  // =====================================================================
+  // == FS 分片上传（multipart）：断点续传 / 进度查询 / 刷新 URL（通用） ==
+  // =====================================================================
 
   router.post("/api/fs/multipart/list-uploads", parseJsonBody, usePolicy("fs.upload", { pathCheck: true, pathResolver: jsonPathResolver("path", { optional: true }) }), async (c) => {
     const { db, encryptionSecret, repositoryFactory, userIdOrInfo, userType } = requireUserContext(c);
@@ -158,7 +210,6 @@ export const registerMultipartRoutes = (router, helpers) => {
     const mountManager = new MountManager(db, encryptionSecret, repositoryFactory, { env: c.env });
     const fileSystem = new FileSystem(mountManager);
     const result = await fileSystem.listMultipartUploads(path, userIdOrInfo, userType);
-
     return jsonOk(c, result, "列出进行中的分片上传成功");
   });
 
@@ -173,6 +224,9 @@ export const registerMultipartRoutes = (router, helpers) => {
 
     assertValidFileName(fileName);
 
+    const sessionRow = await findUploadSessionById(db, { id: uploadId });
+    assertUploadSessionOwnedByUser(sessionRow, userIdOrInfo, userType);
+
     const mountManager = new MountManager(db, encryptionSecret, repositoryFactory, { env: c.env });
     const fileSystem = new FileSystem(mountManager);
     const result = await fileSystem.listMultipartParts(path, uploadId, fileName, userIdOrInfo, userType);
@@ -180,21 +234,42 @@ export const registerMultipartRoutes = (router, helpers) => {
     return jsonOk(c, result, "列出已上传的分片成功");
   });
 
-  router.post("/api/fs/multipart/refresh-urls", parseJsonBody, usePolicy("fs.upload", { pathResolver: jsonPathResolver() }), async (c) => {
+  //签名/刷新分片 URL
+  router.post("/api/fs/multipart/sign-parts", parseJsonBody, usePolicy("fs.upload", { pathResolver: jsonPathResolver() }), async (c) => {
     const { db, encryptionSecret, repositoryFactory, userIdOrInfo, userType } = requireUserContext(c);
     const body = c.get("jsonBody");
     const { path, uploadId, partNumbers } = body;
 
-    if (!path || !uploadId || !Array.isArray(partNumbers) || partNumbers.length === 0) {
+    if (!path || !uploadId) {
       throw new ValidationError("缺少必要参数");
+    }
+
+    const safePartNumbers = Array.isArray(partNumbers) ? partNumbers : [];
+
+    const sessionRow = await findUploadSessionById(db, { id: uploadId });
+    assertUploadSessionOwnedByUser(sessionRow, userIdOrInfo, userType);
+
+    // 状态机推进：请求分片 URL 视为“开始上传”
+    try {
+      await updateUploadSessionById(db, {
+        id: String(uploadId),
+        status: "uploading",
+        expectedStatus: "initiated",
+      });
+    } catch (e) {
+      console.warn("[multipart] sign-parts 更新 upload_sessions.status=uploading 失败（可忽略）:", e?.message || e);
     }
 
     const mountManager = new MountManager(db, encryptionSecret, repositoryFactory, { env: c.env });
     const fileSystem = new FileSystem(mountManager);
-    const result = await fileSystem.refreshMultipartUrls(path, uploadId, partNumbers, userIdOrInfo, userType);
+    const result = await fileSystem.signMultipartParts(path, uploadId, safePartNumbers, userIdOrInfo, userType);
 
-    return jsonOk(c, ensureAbsoluteSessionUploadUrl(c, result), "刷新分片上传预签名URL成功");
+    return jsonOk(c, ensureAbsoluteSessionUploadUrl(c, result), "签名分片上传参数成功");
   });
+
+  // =====================================================================
+  // == FS 分片上传（multipart）：后端中转端点（single_session 专用）     ==
+  // =====================================================================
 
   // 前端分片上传中转端点（single_session 场景）
   // 当前主要用于 GOOGLE_DRIVE：前端使用 Uppy + AwsS3 在浏览器中切片，
@@ -221,9 +296,7 @@ export const registerMultipartRoutes = (router, helpers) => {
     const contentLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) || 0 : 0;
 
     const sessionRow = await findUploadSessionById(db, { id: uploadId });
-    if (!sessionRow) {
-      throw new ValidationError("未找到对应的上传会话");
-    }
+    assertUploadSessionOwnedByUser(sessionRow, userIdOrInfo, userType);
 
     const mountManager = new MountManager(db, encryptionSecret, repositoryFactory, { env: c.env });
     const fileSystem = new FileSystem(mountManager);
@@ -255,6 +328,17 @@ export const registerMultipartRoutes = (router, helpers) => {
       userType,
     });
 
+    // 状态机推进：single_session 只要开始收到分片请求，就视为 uploading
+    try {
+      await updateUploadSessionById(db, {
+        id: String(uploadId),
+        status: "uploading",
+        expectedStatus: "initiated",
+      });
+    } catch (e) {
+      console.warn("[multipart] upload-chunk 更新 upload_sessions.status=uploading 失败（可忽略）:", e?.message || e);
+    }
+
     return jsonOk(
       c,
       {
@@ -267,10 +351,14 @@ export const registerMultipartRoutes = (router, helpers) => {
     );
   });
 
+  // =====================================================================
+  // == FS 预签名直传（单文件）：/presign + /presign/commit（非分片）     ==
+  // =====================================================================
+
   router.post("/api/fs/presign", parseJsonBody, usePolicy("fs.upload", { pathResolver: presignTargetResolver }), async (c) => {
     const { db, encryptionSecret, repositoryFactory, userIdOrInfo, userType } = requireUserContext(c);
     const body = c.get("jsonBody");
-    const { path, fileName, contentType = "application/octet-stream", fileSize = 0 } = body;
+    const { path, fileName, contentType = "application/octet-stream", fileSize = 0, sha256 = null } = body;
 
     if (!path || !fileName) {
       throw new ValidationError("请提供上传路径和文件名");
@@ -293,6 +381,7 @@ export const registerMultipartRoutes = (router, helpers) => {
       fileName,
       fileSize,
       contentType,
+      sha256,
     });
 
     const fileId = generateFileId();
@@ -310,6 +399,10 @@ export const registerMultipartRoutes = (router, helpers) => {
         targetPath,
         contentType: result.contentType,
         headers: result.headers || undefined,
+        sha256: result.sha256 || sha256 || null,
+        repoRelPath: result.repoRelPath || result.storagePath || null,
+        // 透传：如果上游判定对象已存在（去重），可以跳过 PUT，直接 commit 登记
+        skipUpload: result.skipUpload === true,
       },
       { success: true },
     );
@@ -323,6 +416,7 @@ export const registerMultipartRoutes = (router, helpers) => {
     const fileSize = body.fileSize || 0;
     const etag = body.etag || null;
     const contentType = body.contentType || undefined;
+    const sha256 = body.sha256 || body.oid || null;
 
     if (!targetPath || !mountId) {
       throw new ValidationError("请提供完整的上传信息");
@@ -342,6 +436,7 @@ export const registerMultipartRoutes = (router, helpers) => {
       fileSize,
       etag,
       contentType,
+      sha256,
     });
 
     return jsonOk(c, { ...result, publicUrl: result.publicUrl || null, fileName, targetPath, fileSize }, "文件上传完成");

@@ -7,6 +7,9 @@
 <script setup>
 import { ref, onMounted, onBeforeUnmount, watch, nextTick } from "vue";
 import Artplayer from "artplayer";
+import { createLogger } from "@/utils/logger.js";
+
+const log = createLogger("VideoPlayer");
 
 const getExtLower = (name) => {
   const n = String(name || "");
@@ -124,6 +127,7 @@ const emit = defineEmits([
 // 响应式数据
 const artplayerContainer = ref(null);
 const artplayerInstance = ref(null);
+const didAutoApplyDefaultSubtitle = ref(false);
 
 // 计算主题色
 const getThemeColor = () => {
@@ -131,6 +135,100 @@ const getThemeColor = () => {
     return "#8b5cf6"; // 深色模式下使用紫色，与视频文件类型色彩一致
   }
   return props.theme;
+};
+
+const getVideoSourceKey = () => {
+  const v = props.video || {};
+  const url = String(v.url || "");
+  const name = String(v.name || v.title || "");
+  const contentType = String(v.contentType || v.mimetype || "");
+  const linkType = String(v.linkType || v.originalFile?.linkType || "");
+  return `${url}::${name}::${contentType}::${linkType}`;
+};
+
+const getEffectiveSubtitleTracks = () => {
+  const rawTracks = Array.isArray(props.video?.subtitleTracks) ? props.video.subtitleTracks : [];
+  if (rawTracks.length > 0) return rawTracks;
+  if (props.showSubtitle && props.subtitleUrl) {
+    return [{ name: "字幕", url: props.subtitleUrl, type: "srt", default: true }];
+  }
+  return [];
+};
+
+const buildSubtitleSettingPayload = (tracks) => {
+  const effectiveTracks = Array.isArray(tracks) ? tracks : [];
+  if (effectiveTracks.length <= 0) return null;
+
+  const defaultTrack =
+    effectiveTracks.find((t) => t && t.default && t.url) ||
+    effectiveTracks.find((t) => t && t.url) ||
+    null;
+
+  const selector = [
+    { default: !defaultTrack, html: "关闭字幕", url: "" },
+    ...effectiveTracks.map((t) => ({
+      default: !!t?.default,
+      html: String(t?.name || "字幕"),
+      url: String(t?.url || ""),
+      type: String(t?.type || getExtLower(t?.name) || "srt"),
+    })),
+  ];
+
+  return {
+    name: "subtitle",
+    html: "字幕",
+    width: 260,
+    tooltip: defaultTrack?.name || "关闭字幕",
+    selector,
+    onSelect: function (item) {
+      const art = artplayerInstance.value;
+      if (!art) return item?.html;
+      const nextUrl = String(item?.url || "");
+      if (!nextUrl) {
+        if (art.subtitle) art.subtitle.show = false;
+        didAutoApplyDefaultSubtitle.value = true;
+        return "关闭字幕";
+      }
+      if (art.subtitle) {
+        art.subtitle.url = nextUrl;
+        art.subtitle.show = true;
+      }
+      didAutoApplyDefaultSubtitle.value = true;
+      return String(item?.html || "字幕");
+    },
+  };
+};
+
+const applySubtitleSettingsToInstance = () => {
+  const art = artplayerInstance.value;
+  if (!art) return;
+
+  const tracks = getEffectiveSubtitleTracks();
+  const payload = buildSubtitleSettingPayload(tracks);
+  if (!payload) return;
+
+  if (art.setting && typeof art.setting.update === "function" && art.__cpSubtitleInstalled) {
+    art.setting.update(payload);
+  } else if (art.setting && typeof art.setting.add === "function" && !art.__cpSubtitleInstalled) {
+    art.setting.add(payload);
+    art.__cpSubtitleInstalled = true;
+  }
+
+  const defaultTrack =
+    tracks.find((t) => t && t.default && t.url) ||
+    tracks.find((t) => t && t.url) ||
+    null;
+
+  if (!defaultTrack?.url) return;
+
+  const currentUrl = String(art.subtitle?.url || "");
+  if (!didAutoApplyDefaultSubtitle.value && !currentUrl) {
+    if (art.subtitle) {
+      art.subtitle.url = String(defaultTrack.url);
+      art.subtitle.show = true;
+    }
+    didAutoApplyDefaultSubtitle.value = true;
+  }
 };
 
 // 是否应当为当前视频 URL 启用 CORS 模式
@@ -156,6 +254,7 @@ const shouldEnableCorsMode = (rawUrl, linkType) => {
 // 初始化 Artplayer
 const initArtplayer = async () => {
   if (!artplayerContainer.value || !props.video?.url) return;
+  didAutoApplyDefaultSubtitle.value = false;
 
   // 销毁现有实例
   if (artplayerInstance.value) {
@@ -174,9 +273,9 @@ const initArtplayer = async () => {
         if (artplayerInstance.value.streamPlayer.destroy) {
           artplayerInstance.value.streamPlayer.destroy();
         }
-        console.log("🧹 流媒体播放器清理完成");
+        log.debug("流媒体播放器清理完成");
       } catch (error) {
-        console.warn("清理流媒体播放器时出错:", error);
+        log.warn("清理流媒体播放器时出错:", error);
       }
     }
 
@@ -244,13 +343,8 @@ const initArtplayer = async () => {
   }
 
   // 字幕列表
-  const rawTracks = Array.isArray(props.video?.subtitleTracks) ? props.video.subtitleTracks : [];
-  const effectiveTracks =
-    rawTracks.length > 0
-      ? rawTracks
-      : props.showSubtitle && props.subtitleUrl
-        ? [{ name: "字幕", url: props.subtitleUrl, type: "srt", default: true }]
-        : [];
+  const effectiveTracks = getEffectiveSubtitleTracks();
+  let initialSubtitleSettingPayload = null;
 
   if (effectiveTracks.length > 0) {
     const defaultTrack = effectiveTracks.find((t) => t && t.default && t.url) || effectiveTracks.find((t) => t && t.url) || null;
@@ -265,35 +359,8 @@ const initArtplayer = async () => {
       };
     }
 
-    const selector = [
-      { default: !defaultTrack, html: "关闭字幕", url: "" },
-      ...effectiveTracks.map((t) => ({
-        default: !!t.default,
-        html: String(t.name || "字幕"),
-        url: String(t.url || ""),
-        type: String(t.type || getExtLower(t.name) || "srt"),
-      })),
-    ];
-
-    options.settings.push({
-      name: "subtitle",
-      html: "字幕",
-      width: 260,
-      tooltip: defaultTrack?.name || "关闭字幕",
-      selector,
-      onSelect: function (item) {
-        const art = artplayerInstance.value;
-        if (!art) return item?.html;
-        const nextUrl = String(item?.url || "");
-        if (!nextUrl) {
-          art.subtitle.show = false;
-          return "关闭字幕";
-        }
-        art.subtitle.url = nextUrl;
-        art.subtitle.show = true;
-        return String(item?.html || "字幕");
-      },
-    });
+    initialSubtitleSettingPayload = buildSubtitleSettingPayload(effectiveTracks);
+    if (initialSubtitleSettingPayload) options.settings.push(initialSubtitleSettingPayload);
   }
 
   // 添加跨域支持以启用截图功能
@@ -320,12 +387,15 @@ const initArtplayer = async () => {
   try {
     // 创建 Artplayer 实例
     artplayerInstance.value = new Artplayer(options);
+    if (initialSubtitleSettingPayload) {
+      artplayerInstance.value.__cpSubtitleInstalled = true;
+    }
 
     // 如果是流媒体播放器，将播放器实例从video元素转移到artplayerInstance
     if (artplayerInstance.value.video) {
       if (artplayerInstance.value.video.streamPlayer) {
         artplayerInstance.value.streamPlayer = artplayerInstance.value.video.streamPlayer;
-        console.log("流媒体播放器实例已转移到Artplayer实例");
+        log.debug("流媒体播放器实例已转移到Artplayer实例");
       }
     }
 
@@ -335,10 +405,12 @@ const initArtplayer = async () => {
     // 应用主题样式
     applyThemeStyles();
 
+    // 字幕列表可能是异步补齐的，实例创建后再做一次“热更新”兜底
+    applySubtitleSettingsToInstance();
 
     emit("ready", artplayerInstance.value);
   } catch (error) {
-    console.error("Artplayer 初始化失败:", error);
+    log.error("Artplayer 初始化失败:", error);
     emit("error", error);
   }
 };
@@ -381,11 +453,11 @@ const addStreamingSupport = async (options) => {
   const streamingFormat = detectStreamingFormat(videoUrl, contentType, fileName);
 
   if (!streamingFormat) {
-    console.log("非流媒体格式，使用默认播放器");
+    log.debug("非流媒体格式，使用默认播放器");
     return;
   }
 
-  console.log(`检测到${streamingFormat.toUpperCase()}格式，正在加载相应播放器...`);
+  log.debug(`检测到${streamingFormat.toUpperCase()}格式，正在加载相应播放器...`);
 
   try {
     // 初始化customType对象
@@ -397,7 +469,7 @@ const addStreamingSupport = async (options) => {
       await setupMpegTSPlayer(options, videoUrl, streamingFormat);
     }
   } catch (error) {
-    console.error(`加载${streamingFormat}播放器失败:`, error);
+    log.error(`加载${streamingFormat}播放器失败:`, error);
     emit("error", {
       type: `${streamingFormat}_load_error`,
       message: `加载${streamingFormat.toUpperCase()}播放器失败: ${error.message}`,
@@ -413,7 +485,7 @@ const setupHLSPlayer = async (options, videoUrl) => {
 
   // 检查浏览器支持
   if (!Hls.default.isSupported()) {
-    console.warn(" 当前浏览器不支持HLS播放");
+    log.warn(" 当前浏览器不支持HLS播放");
     emit("error", {
       type: "hls_not_supported",
       message: "当前浏览器不支持HLS播放，请使用Chrome、Firefox或Edge浏览器",
@@ -634,7 +706,7 @@ const setupHLSPlayer = async (options, videoUrl) => {
             break;
           default:
             errorMessage = `HLS播放错误: ${data.details || "未知错误"}`;
-            console.error("HLS致命错误，销毁播放器:", data.details);
+            log.error("HLS致命错误，销毁播放器:", data.details);
             hlsPlayer.destroy();
             break;
         }
@@ -672,7 +744,7 @@ const setupHLSPlayer = async (options, videoUrl) => {
       // 菜单：只在 HLS 时出现
       installHlsMenus(art, hlsPlayer);
     }
-    console.log("HLS播放器初始化完成");
+    log.debug("HLS播放器初始化完成");
   };
 
   // 设置URL类型为 m3u8
@@ -681,14 +753,14 @@ const setupHLSPlayer = async (options, videoUrl) => {
 
 // 设置 mpegts.js 播放器 (支持 FLV 和 MPEG-TS)
 const setupMpegTSPlayer = async (options, videoUrl, format) => {
-  console.log(`正在加载 mpegts.js 用于 ${format.toUpperCase()} 播放...`);
+  log.debug(`正在加载 mpegts.js 用于 ${format.toUpperCase()} 播放...`);
 
   // 动态导入 mpegts.js
   const mpegts = await import("mpegts.js");
 
   // 检查浏览器支持
   if (!mpegts.isSupported?.()) {
-    console.warn("当前浏览器不支持MPEG-TS/FLV播放");
+    log.warn("当前浏览器不支持MPEG-TS/FLV播放");
     emit("error", {
       type: `${format}_not_supported`,
       message: `当前浏览器不支持${format.toUpperCase()}播放，请使用Chrome、Firefox或Edge浏览器`,
@@ -696,11 +768,11 @@ const setupMpegTSPlayer = async (options, videoUrl, format) => {
     return;
   }
 
-  console.log(`mpegts.js加载成功，配置${format.toUpperCase()}播放器...`);
+  log.debug(`mpegts.js加载成功，配置${format.toUpperCase()}播放器...`);
 
   // 配置自定义类型
   options.customType[format] = function (video, url) {
-    console.log(`初始化${format.toUpperCase()}播放器，URL:`, url);
+    log.debug(`初始化${format.toUpperCase()}播放器，URL:`, url);
 
     const inferredTsType =
       format === "flv"
@@ -728,7 +800,7 @@ const setupMpegTSPlayer = async (options, videoUrl, format) => {
 
     // 播放器事件处理
     streamPlayer.on(mpegts.Events.ERROR, (errorType, errorDetail) => {
-      console.error(`${format.toUpperCase()}播放错误:`, errorType, errorDetail);
+      log.error(`${format.toUpperCase()}播放错误:`, errorType, errorDetail);
 
       let errorMessage = `${format.toUpperCase()}播放出现错误`;
       switch (errorType) {
@@ -754,15 +826,15 @@ const setupMpegTSPlayer = async (options, videoUrl, format) => {
     });
 
     streamPlayer.on(mpegts.Events.LOADING_COMPLETE, () => {
-      console.log(`${format.toUpperCase()}加载完成`);
+      log.debug(`${format.toUpperCase()}加载完成`);
     });
 
     streamPlayer.on(mpegts.Events.RECOVERED_EARLY_EOF, () => {
-      console.log(`${format.toUpperCase()}早期EOF恢复`);
+      log.debug(`${format.toUpperCase()}早期EOF恢复`);
     });
 
     streamPlayer.on(mpegts.Events.MEDIA_INFO, (mediaInfo) => {
-      console.log(`${format.toUpperCase()}媒体信息:`, mediaInfo);
+      log.debug(`${format.toUpperCase()}媒体信息:`, mediaInfo);
     });
 
     // 绑定到video元素并加载
@@ -772,13 +844,13 @@ const setupMpegTSPlayer = async (options, videoUrl, format) => {
     // 存储streamPlayer实例以便后续清理
     video.streamPlayer = streamPlayer;
 
-    console.log(`${format.toUpperCase()}播放器初始化完成`);
+    log.debug(`${format.toUpperCase()}播放器初始化完成`);
   };
 
   // 设置URL类型
   options.type = format;
 
-  console.log(` ${format.toUpperCase()}支持配置完成`);
+  log.debug(`${format.toUpperCase()}支持配置完成`);
 };
 
 // 绑定事件监听器
@@ -828,7 +900,7 @@ const bindEvents = () => {
   });
 
   art.on("error", (error) => {
-    console.error("Artplayer 播放错误:", error);
+    log.error("Artplayer 播放错误:", error);
     emit("error", error);
   });
 
@@ -969,7 +1041,7 @@ const screenshot = async (filename) => {
       artplayerInstance.value.screenshot(filename || `video-screenshot-${Date.now()}`);
       return true;
     } catch (error) {
-      console.error("截图失败:", error);
+      log.error("截图失败:", error);
       return false;
     }
   }
@@ -981,7 +1053,7 @@ const getScreenshotDataURL = async () => {
     try {
       return await artplayerInstance.value.getDataURL();
     } catch (error) {
-      console.error("获取截图 DataURL 失败:", error);
+      log.error("获取截图 DataURL 失败:", error);
       return null;
     }
   }
@@ -993,7 +1065,7 @@ const getScreenshotBlobUrl = async () => {
     try {
       return await artplayerInstance.value.getBlobUrl();
     } catch (error) {
-      console.error("获取截图 BlobUrl 失败:", error);
+      log.error("获取截图 BlobUrl 失败:", error);
       return null;
     }
   }
@@ -1102,11 +1174,10 @@ watch(
 );
 
 watch(
-  () => [props.video, props.loop, props.volume, props.muted],
+  () => getVideoSourceKey(),
   () => {
     initArtplayer();
-  },
-  { deep: true }
+  }
 );
 
 watch(
@@ -1123,6 +1194,32 @@ watch(
   }
 );
 
+watch(
+  () => props.loop,
+  (val) => {
+    const art = artplayerInstance.value;
+    if (!art) return;
+    try {
+      art.loop = !!val;
+    } catch {
+      initArtplayer();
+    }
+  }
+);
+
+watch(
+  () => {
+    const tracks = getEffectiveSubtitleTracks();
+    const key = tracks
+      .map((t) => `${String(t?.url || "")}:${t?.default ? 1 : 0}:${String(t?.type || "")}`)
+      .join("|");
+    return `${props.showSubtitle ? 1 : 0}::${String(props.subtitleUrl || "")}::${key}`;
+  },
+  () => {
+    applySubtitleSettingsToInstance();
+  }
+);
+
 // 生命周期
 onMounted(() => {
   nextTick(() => {
@@ -1135,7 +1232,7 @@ onBeforeUnmount(() => {
     // 清理流媒体播放器实例
     if (artplayerInstance.value.streamPlayer) {
       try {
-        console.log("🧹 清理流媒体播放器实例...");
+        log.debug("清理流媒体播放器实例...");
         if (artplayerInstance.value.streamPlayer.pause) {
           artplayerInstance.value.streamPlayer.pause();
         }
@@ -1148,9 +1245,9 @@ onBeforeUnmount(() => {
         if (artplayerInstance.value.streamPlayer.destroy) {
           artplayerInstance.value.streamPlayer.destroy();
         }
-        console.log("🧹 流媒体播放器清理完成");
+        log.debug("流媒体播放器清理完成");
       } catch (error) {
-        console.warn("清理流媒体播放器时出错:", error);
+        log.warn("清理流媒体播放器时出错:", error);
       }
     }
 

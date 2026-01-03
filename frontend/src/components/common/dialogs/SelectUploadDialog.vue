@@ -140,9 +140,11 @@ import { formatDateTimeWithSeconds } from "@/utils/timeUtils.js";
 import { IconCheckbox, IconClock, IconCopy, IconDocument } from "@/components/icons";
 import { useEventListener } from "@vueuse/core";
 import { copyToClipboard } from "@/utils/clipboard";
+import { createLogger } from "@/utils/logger.js";
 
 // 国际化
 const { t } = useI18n();
+const log = createLogger("SelectUploadDialog");
 
 const props = defineProps({
   isOpen: {
@@ -208,15 +210,33 @@ const getMatchScoreDisplay = (upload, index) => {
 // 获取已上传分片数量的精确显示（分离主信息 + 小字进度）
 const getUploadedPartsInfo = (upload) => {
   const buildProgressText = () => {
-    if (typeof upload?.bytesUploaded !== "number" || !Number.isFinite(upload.bytesUploaded) || upload.bytesUploaded < 0) return "";
-    if (!upload?.fileSize) return "";
+    const totalBytes = Number(upload?.fileSize) || 0;
+    if (!Number.isFinite(totalBytes) || totalBytes <= 0) return "";
 
-    const totalBytes = Number(upload.fileSize) || 0;
-    const uploadedBytes = Math.min(Number(upload.bytesUploaded) || 0, totalBytes);
+    // 进度的“主依据”：
+    // - 优先用 ServerResumePlugin 预先计算好的 bytesUploaded
+    // - 如果没有 bytesUploaded，才用 uploadedParts/parts 的 size 求和兜底
+    let uploadedBytes = Number(upload?.bytesUploaded);
+    if (!Number.isFinite(uploadedBytes) || uploadedBytes < 0) {
+      const parts = Array.isArray(upload?.uploadedParts) ? upload.uploadedParts : upload?.parts;
+      if (!Array.isArray(parts) || parts.length === 0) return "";
+      uploadedBytes = parts.reduce((sum, p) => {
+        const s = Number(p?.size ?? p?.Size ?? 0);
+        if (!Number.isFinite(s) || s <= 0) return sum;
+        return sum + s;
+      }, 0);
+    }
+
+    uploadedBytes = Math.min(Math.max(0, uploadedBytes), totalBytes);
+
     const uploadedMB = (uploadedBytes / (1024 * 1024)).toFixed(1);
     const totalMB = (totalBytes / (1024 * 1024)).toFixed(1);
     const percentage = totalBytes > 0 ? ((uploadedBytes / totalBytes) * 100).toFixed(1) : "0.0";
-    return t("common.dialogs.selectUpload.progressInfo", { percentage, uploaded: uploadedMB, total: totalMB });
+    return t("common.dialogs.selectUpload.progressInfo", {
+      percentage,
+      uploaded: uploadedMB,
+      total: totalMB,
+    });
   };
 
   const progressText = buildProgressText();
@@ -309,7 +329,7 @@ const copyUploadId = async (uploadId) => {
       throw new Error("copy_failed");
     }
   } catch (error) {
-    console.error("复制失败:", error);
+    log.error("复制失败:", error);
   }
 };
 
